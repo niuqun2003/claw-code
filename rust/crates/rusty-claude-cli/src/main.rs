@@ -6018,6 +6018,93 @@ fn summarize_tool_payload_for_markdown(payload: &str) -> String {
     truncate_for_summary(&compact, SESSION_MARKDOWN_TOOL_SUMMARY_LIMIT)
 }
 
+/// Structured export error envelope (#130).
+/// Conforms to Phase 2 §4.44 typed-error envelope contract.
+/// Includes kind/operation/target/errno/hint/retryable for actionable diagnostics.
+#[derive(Debug, serde::Serialize)]
+struct ExportError {
+    kind: String,
+    operation: String,
+    target: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    errno: Option<String>,
+    hint: String,
+    retryable: bool,
+}
+
+impl std::fmt::Display for ExportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "export failed: {} ({})\n  target: {}\n  errno: {}\n  hint: {}",
+            self.kind,
+            self.operation,
+            self.target,
+            self.errno.as_deref().unwrap_or("unknown"),
+            self.hint
+        )
+    }
+}
+
+impl std::error::Error for ExportError {}
+
+/// Wrap std::io::Error into a structured ExportError per §4.44.
+fn wrap_export_io_error(path: &Path, op: &str, e: std::io::Error) -> ExportError {
+    use std::io::ErrorKind;
+    let target_display = path.display().to_string();
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.display().to_string());
+    let (kind, hint) = match e.kind() {
+        ErrorKind::NotFound => (
+            "filesystem",
+            parent
+                .as_ref()
+                .map(|p| format!("intermediate directory does not exist; try `mkdir -p {p}` first"))
+                .unwrap_or_else(|| {
+                    "path is empty or invalid; provide a non-empty file path".to_string()
+                }),
+        ),
+        ErrorKind::PermissionDenied => (
+            "permission",
+            format!(
+                "permission denied; check file permissions with `ls -la {}`",
+                parent.as_deref().unwrap_or(".")
+            ),
+        ),
+        ErrorKind::IsADirectory => (
+            "filesystem",
+            format!(
+                "path `{}` is a directory, not a file; use a file path like `{}/session.md`",
+                target_display, target_display
+            ),
+        ),
+        ErrorKind::AlreadyExists => (
+            "filesystem",
+            format!("path `{target_display}` already exists; remove it or pick a different name"),
+        ),
+        ErrorKind::InvalidInput | ErrorKind::InvalidData => (
+            "invalid_path",
+            format!("path `{target_display}` is invalid; check for empty or malformed input"),
+        ),
+        _ => (
+            "filesystem",
+            format!(
+                "unexpected error writing to `{target_display}`; check disk space and path validity"
+            ),
+        ),
+    };
+    ExportError {
+        kind: kind.to_string(),
+        operation: op.to_string(),
+        target: target_display,
+        errno: Some(format!("{:?}", e.kind())),
+        hint,
+        retryable: matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::Interrupted),
+    }
+}
+
 fn run_export(
     session_reference: &str,
     output_path: Option<&Path>,
@@ -6027,7 +6114,9 @@ fn run_export(
     let markdown = render_session_markdown(&session, &handle.id, &handle.path);
 
     if let Some(path) = output_path {
-        fs::write(path, &markdown)?;
+        fs::write(path, &markdown).map_err(|e| {
+            Box::new(wrap_export_io_error(path, "write", e)) as Box<dyn std::error::Error>
+        })?;
         let report = format!(
             "Export\n  Result           wrote markdown transcript\n  File             {}\n  Session          {}\n  Messages         {}",
             path.display(),
