@@ -6143,3 +6143,23 @@ load_session('nonexistent')  # raises FileNotFoundError with no structured error
 **Blocker.** None.
 
 **Source.** Jobdori dogfood sweep 2026-04-22 08:46 KST — inspected `src/session_store.py` public API, confirmed only `save_session` + `load_session` present, no list/delete/exists surface.
+
+## Pinpoint #161. `run_turn_loop` has no wall-clock timeout — a stalled turn blocks indefinitely
+
+**Gap.** `PortRuntime.run_turn_loop` (`src/runtime.py:154`) bounds execution only by `max_turns` (a turn count). There is no wall-clock deadline or per-turn timeout. If a single `engine.submit_message` call stalls (e.g., waiting on a slow or hung external provider, a network timeout, or an infinite LLM stream), the entire turn loop hangs with no structured signal, no cancellation path, and no timeout error returned to the caller.
+
+**Repro (conceptual).** Wrap `engine.submit_message` with an artificial `time.sleep(9999)` and call `run_turn_loop` — it blocks forever. There is no `asyncio.wait_for`, `signal.alarm`, `concurrent.futures.TimeoutError`, or equivalent in the call path. `grep -n 'timeout\|deadline\|elapsed\|wall' src/runtime.py src/query_engine.py` returns zero results.
+
+**Impact.** A claw calling `run_turn_loop` in a CI pipeline or orchestration harness has no reliable way to enforce a deadline. The loop will hang until the OS kills the process or a human intervenes. The caller cannot distinguish "still running" from "hung" without an external watchdog.
+
+**Fix shape (~15 lines).**
+1. Add an optional `timeout_seconds: float | None = None` parameter to `run_turn_loop`.
+2. Use `concurrent.futures.ThreadPoolExecutor` + `Future.result(timeout=...)` (or `asyncio.wait_for` if the engine becomes async) to wrap each `submit_message` call.
+3. On timeout, append a sentinel `TurnResult` with `stop_reason='timeout'` and break the loop.
+4. Document the timeout contract: total wall-clock budget across all turns, not per-turn.
+
+**Acceptance.** `run_turn_loop(prompt, timeout_seconds=10)` raises `TimeoutError` (or returns a `TurnResult` with `stop_reason='timeout'`) within 10 seconds even if the underlying LLM call stalls indefinitely. `timeout_seconds=None` (default) preserves existing behaviour.
+
+**Blocker.** None.
+
+**Source.** Jobdori dogfood sweep 2026-04-22 08:56 KST — grepped `src/runtime.py` and `src/query_engine.py` for any timeout/deadline/wall-clock mechanism; found none.
